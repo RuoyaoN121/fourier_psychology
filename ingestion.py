@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import urllib.error
 import urllib.request
 from typing import Dict, List, Tuple
@@ -208,6 +209,9 @@ def fetch_github_events(
         req = urllib.request.Request(url)
         req.add_header("Accept", "application/vnd.github.v3+json")
         req.add_header("User-Agent", "FourierPsychology/1.0")
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            req.add_header("Authorization", f"token {token}")
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode())
