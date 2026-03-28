@@ -1,18 +1,20 @@
 """
-Spectral Sabermetrics — Part 1: Data Ingestion Pipeline
-========================================================
-Extracts developer PushEvent activity from the GitHub Archive BigQuery dataset,
-aggregates it into zero-filled hourly time-series suitable for FFT analysis.
+Fourier Psychology — Data Ingestion Pipeline
+=============================================
+Three data sources:
 
-Includes a demo/fallback mode that synthesises realistic data locally so the
-dashboard can be demonstrated without BigQuery credentials.
+1. **Public GitHub API** — fetches a single user's public events (no auth).
+2. **GitHub Archive BigQuery** — bulk extraction (requires GCP credentials).
+3. **Synthetic** — generates realistic signals for testing and baselines.
 """
 
 from __future__ import annotations
 
-import datetime as dt
+import json
 import logging
-from typing import Dict
+import urllib.error
+import urllib.request
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -56,23 +58,6 @@ WHERE
     AND type = 'PushEvent'
 """
 
-_MACRO_BQ_QUERY_TEMPLATE = """
-SELECT
-    EXTRACT(DATE FROM created_at) AS ds,
-    COUNT(*) AS pushes
-FROM
-    `githubarchive.day.20*`
-WHERE
-    _TABLE_SUFFIX BETWEEN
-        FORMAT_DATE('%y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL {years} YEAR))
-        AND FORMAT_DATE('%y%m%d', CURRENT_DATE())
-    AND type = 'PushEvent'
-    AND repo.name LIKE '{org}/%'
-GROUP BY
-    ds
-ORDER BY
-    ds
-"""
 
 def fetch_from_bigquery(n: int = 100, days: int = 180) -> pd.DataFrame:
     """Run the extraction query against BigQuery and return a raw DataFrame.
@@ -199,89 +184,102 @@ def load_data(use_bigquery: bool = False, **kwargs) -> Dict[str, np.ndarray]:
 
 
 # ---------------------------------------------------------------------------
-# Macro-Sabermetrics Data Loader
+# Public GitHub API — single-user event fetcher (no auth required)
 # ---------------------------------------------------------------------------
 
-def fetch_macro_data(
-    org_pattern: str = "microsoft",
-    ticker: str = "MSFT",
-    years: int = 3,
-    use_bigquery: bool = False,
-) -> pd.DataFrame:
-    """Fetch org-wide GitHub push counts and merge with historical stock prices.
+_GITHUB_MAX_PAGES = 10  # GitHub API hard limit for the Events endpoint
+
+def fetch_github_events(
+    username: str,
+    max_pages: int = _GITHUB_MAX_PAGES,
+) -> List[dict]:
+    """Fetch public events for a GitHub user via the REST API.
+
+    No authentication required.  Rate limit: 60 requests/hour per IP.
+    The Events endpoint allows at most 10 pages of 30 events (300 total).
+    """
+    max_pages = min(max_pages, _GITHUB_MAX_PAGES)
+    all_events: List[dict] = []
+    for page in range(1, max_pages + 1):
+        url = (
+            f"https://api.github.com/users/{username}"
+            f"/events?page={page}&per_page=30"
+        )
+        req = urllib.request.Request(url)
+        req.add_header("Accept", "application/vnd.github.v3+json")
+        req.add_header("User-Agent", "FourierPsychology/1.0")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+                if not data:
+                    break
+                all_events.extend(data)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise ValueError(f"GitHub user '{username}' not found.")
+            elif e.code == 403:
+                raise ValueError(
+                    "GitHub API rate limit exceeded (60 req/hour without auth). "
+                    "Try again later."
+                )
+            # 422 or any other HTTP error: stop paginating, keep what we have
+            logger.warning(
+                "HTTP %d on page %d for %s — stopping pagination.",
+                e.code, page, username,
+            )
+            break
+
+    logger.info("Fetched %d public events for %s.", len(all_events), username)
+    return all_events
+
+
+def build_signal_from_events(
+    events: List[dict],
+) -> Tuple[np.ndarray, str, str, int]:
+    """Convert GitHub API events into an hourly signal array.
 
     Parameters
     ----------
-    org_pattern : str
-        Organization prefix to match repositories (e.g., 'microsoft').
-    ticker : str
-        Stock ticker symbol for yfinance.
-    years : int
-        Number of historical years to fetch.
-    use_bigquery : bool
-        If True, executes BigQuery SQL. If False, generates synthetic fallback.
+    events : list[dict]
+        Raw events from ``fetch_github_events``.
 
     Returns
     -------
-    pd.DataFrame
-        DataFrame indexed by date sequence with ['pushes', 'Close'].
+    signal : np.ndarray
+        Zero-filled hourly event-count array.
+    start_date : str
+        ISO date of first event.
+    end_date : str
+        ISO date of last event.
+    start_weekday : int
+        Weekday of the first hour (0 = Monday, 6 = Sunday).
     """
-    import yfinance as yf
+    timestamps = []
+    for e in events:
+        if "created_at" in e:
+            timestamps.append(pd.to_datetime(e["created_at"], utc=True))
 
-    end_date = dt.datetime.now()
-    start_date = end_date - dt.timedelta(days=years * 365)
-    
-    logger.info("Downloading %s stock data from %s to %s", ticker, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
-    stock_df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-    
-    # Handle yfinance multi-index vs single-index depending on version
-    if isinstance(stock_df.columns, pd.MultiIndex):
-        stock_close = stock_df['Close'][ticker].to_frame('Close')
-    else:
-        stock_close = stock_df[['Close']].copy()
+    if not timestamps:
+        raise ValueError("No events with timestamps found.")
 
-    # Normalise index
-    stock_close.index = pd.to_datetime(stock_close.index).tz_localize(None)
+    timestamps.sort()
 
-    if use_bigquery:
-        from google.cloud import bigquery
-        client = bigquery.Client()
-        query = _MACRO_BQ_QUERY_TEMPLATE.format(org=org_pattern, years=years)
-        logger.info("Submitting Macro BigQuery job for org %s over %d years...", org_pattern, years)
-        bq_df = client.query(query).to_dataframe()
-        bq_df['ds'] = pd.to_datetime(bq_df['ds']).dt.tz_localize(None)
-        bq_df.set_index('ds', inplace=True)
-    else:
-        # Synthetic macroscopic org data
-        logger.info("Generating synthetic Macro BigQuery data for %s", org_pattern)
-        idx = pd.date_range(start=start_date, end=end_date, freq='d')
-        rng = np.random.default_rng(42)
-        base = 5000 + 1000 * np.sin(np.linspace(0, 10, len(idx)))  # Trend wave
-        # Add weekend dips (lower activity)
-        weekend_mask = idx.dayofweek >= 5
-        base[weekend_mask] *= 0.3
-        pushes = rng.poisson(base).astype(float)
-        
-        # Add high-frequency noise spikes (stress periods)
-        spike_prob = 0.05
-        spikes = rng.random(size=len(idx)) < spike_prob
-        pushes[spikes] += rng.uniform(2000, 5000, size=spikes.sum())
-        
-        bq_df = pd.DataFrame({'pushes': pushes}, index=idx)
+    hour_min = timestamps[0].floor("h")
+    hour_max = timestamps[-1].floor("h")
 
-    # Merge GitHub and stock data (Left join keeps all contiguous calendar days)
-    df = bq_df.join(stock_close, how='left')
-    
-    # Forward-fill stock prices on weekends and holidays
-    df['Close'] = df['Close'].ffill()
-    
-    # Backfill just in case the first couple of days were weekends
-    df['Close'] = df['Close'].bfill()
-    
-    logger.info("Macro data merged. Resulting shape: %s", df.shape)
-    
-    # Flatten multi-index if it exists
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-        
-    return df
+    full_range = pd.date_range(start=hour_min, end=hour_max, freq="h")
+
+    # Count events per hour
+    hour_bins = pd.Series([ts.floor("h") for ts in timestamps])
+    counts = hour_bins.value_counts().reindex(full_range, fill_value=0).sort_index()
+
+    signal = counts.values.astype(np.float64)
+    start_date = hour_min.strftime("%Y-%m-%d")
+    end_date = hour_max.strftime("%Y-%m-%d")
+    start_weekday = hour_min.weekday()
+
+    logger.info(
+        "Built signal: %d hours (%s to %s), %d total events.",
+        len(signal), start_date, end_date, int(signal.sum()),
+    )
+    return signal, start_date, end_date, start_weekday
